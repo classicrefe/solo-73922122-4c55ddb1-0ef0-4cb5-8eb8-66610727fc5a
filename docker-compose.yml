@@ -1,0 +1,23 @@
+services:
+  mock:
+    build: ./mock_exchange
+    container_name: mock-exchange
+    ports:
+      - "8001:8001"   # 本地模拟行情源（HTTP 快照 + WS 增量），无需账号
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  collector:
+    build: ./collector
+    container_name: depth-collector
+    environment:
+      MOCK_HTTP: http://mock:8001
+      MOCK_WS: ws://mock:8001/ws/btcusdt@depth
+    ports:
+      - "8000:8000"   # 浏览器入口：http://localhost:8000
+    depends_on:
+      mock:
+        condition: service_healthy

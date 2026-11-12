@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>深度行情采集控制台</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #1a2130; --border: #2a3348;
+    --text: #e6e9f0; --muted: #8a93a6;
+    --green: #2ebd85; --red: #f6465d; --amber: #f0b90b; --gray: #6b7280;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; padding: 20px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 1100px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .panel h2 { font-size: 15px; margin-bottom: 12px; color: var(--muted); font-weight: 600; }
+  .full { grid-column: 1 / -1; }
+  .badge { display: inline-block; padding: 4px 14px; border-radius: 999px; font-size: 14px; font-weight: 600; }
+  .badge.synced { background: rgba(46,189,133,.15); color: var(--green); }
+  .badge.syncing, .badge.resyncing { background: rgba(240,185,11,.15); color: var(--amber); }
+  .badge.stopped { background: rgba(107,114,128,.2); color: var(--gray); }
+  .row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  button { background: var(--amber); border: none; color: #1a2130; font-weight: 700; padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button:hover { filter: brightness(1.1); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 10px; font-size: 14px; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); }
+  .bid { color: var(--green); } .ask { color: var(--red); }
+  .books { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 12px; }
+  .kv .item { background: rgba(255,255,255,.03); border-radius: 8px; padding: 8px 12px; }
+  .kv .k { font-size: 12px; color: var(--muted); }
+  .kv .v { font-size: 16px; font-weight: 600; margin-top: 2px; }
+  .err { color: var(--red); font-size: 13px; margin-top: 10px; min-height: 18px; }
+  label.sc { display: flex; align-items: center; gap: 8px; padding: 8px 0; font-size: 14px; cursor: pointer; }
+  input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--amber); }
+  input[type=number] { width: 90px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 4px 8px; font-size: 14px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.6; }
+  .nosync { color: var(--muted); text-align: center; padding: 24px 0; font-size: 14px; }
+</style>
+</head>
+<body>
+<h1>深度行情采集控制台 <span id="symbol" style="color:var(--amber)"></span></h1>
+<div class="sub">采集端 → 本地模拟行情源（Binance Spot 快照 + diff depth）｜每侧最多 100 档，页面展示前五档</div>
+
+<div class="grid">
+  <div class="panel full">
+    <h2>采集控制与同步状态</h2>
+    <div class="row">
+      <button id="btnStart">启动采集</button>
+      <button id="btnStop" class="ghost">停止采集</button>
+      <span id="statusBadge" class="badge stopped">已停止</span>
+      <span style="color:var(--muted);font-size:13px">lastUpdateId (L)：<b id="luid" style="color:var(--text)">—</b></span>
+      <span style="color:var(--muted);font-size:13px">档位：买 <b id="lvB" style="color:var(--text)">0</b> / 卖 <b id="lvA" style="color:var(--text)">0</b></span>
+    </div>
+    <div class="kv">
+      <div class="item"><div class="k">已应用增量</div><div class="v" id="stApplied">0</div></div>
+      <div class="item"><div class="k">丢弃（重复/过期）</div><div class="v" id="stDropped">0</div></div>
+      <div class="item"><div class="k">缺号次数</div><div class="v" id="stGaps">0</div></div>
+      <div class="item"><div class="k">重同步次数</div><div class="v" id="stResyncs">0</div></div>
+      <div class="item"><div class="k">快照 成功/尝试</div><div class="v" id="stSnap">0/0</div></div>
+    </div>
+    <div class="err" id="lastError"></div>
+  </div>
+
+  <div class="panel full">
+    <h2>买卖前五档（未同步时不发布报价）</h2>
+    <div class="books">
+      <div>
+        <table>
+          <thead><tr><th>买价 (Bid)</th><th>数量</th></tr></thead>
+          <tbody id="bidsBody"></tbody>
+        </table>
+      </div>
+      <div>
+        <table>
+          <thead><tr><th>卖价 (Ask)</th><th>数量</th></tr></thead>
+          <tbody id="asksBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="nosync" id="noSyncHint">采集未就绪，报价不可用</div>
+  </div>
+
+  <div class="panel full">
+    <h2>故障场景开关（作用于行情源）</h2>
+    <div class="row" style="align-items:flex-start">
+      <div>
+        <label class="sc"><input type="checkbox" id="scDelay"> 快照延迟
+          <input type="number" id="scDelayMs" min="100" max="10000" step="100" value="3000"> ms</label>
+        <label class="sc"><input type="checkbox" id="scFail"> 快照失败（HTTP 500，不得报就绪）</label>
+      </div>
+      <div>
+        <label class="sc"><input type="checkbox" id="scDup"> 重复消息（同一条增量发两遍）</label>
+        <label class="sc"><input type="checkbox" id="scGap"> 缺号注入（周期性跳过更新编号）</label>
+        <label class="sc"><input type="checkbox" id="scDisc"> 断线注入（周期性关闭连接）</label>
+      </div>
+    </div>
+    <div class="hint">
+      验证要点：快照延迟期间增量被缓存、不就绪；重复消息按 u ≤ L 丢弃；缺号（U &gt; L+1）与断线立即停止发布并自动重同步；快照失败时状态绝不变为「已同步」。
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const STATUS_TEXT = { stopped: "已停止", syncing: "同步中（缓存增量/取快照）", synced: "已同步 · 发布有效报价", resyncing: "重新同步中" };
+
+async function post(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return r.json();
+}
+
+$("btnStart").onclick = () => post("/api/control", { action: "start" }).then(refresh);
+$("btnStop").onclick = () => post("/api/control", { action: "stop" }).then(refresh);
+
+function currentScenario() {
+  return {
+    snapshot_delay_ms: $("scDelay").checked ? Math.max(100, +$("scDelayMs").value || 0) : 0,
+    snapshot_fail: $("scFail").checked,
+    duplicates: $("scDup").checked,
+    gap: $("scGap").checked,
+    disconnect: $("scDisc").checked,
+  };
+}
+for (const id of ["scDelay", "scDelayMs", "scFail", "scDup", "scGap", "scDisc"]) {
+  $(id).onchange = () => post("/api/scenario", currentScenario());
+}
+
+function renderRows(tbody, rows, cls) {
+  tbody.innerHTML = rows.length
+    ? rows.map(([p, q]) => `<tr><td class="${cls}">${p}</td><td>${q}</td></tr>`).join("")
+    : `<tr><td colspan="2" style="color:var(--muted)">—</td></tr>`;
+}
+
+async function refresh() {
+  try {
+    const s = await (await fetch("/api/state")).json();
+    $("symbol").textContent = s.symbol;
+    const badge = $("statusBadge");
+    badge.className = "badge " + s.status;
+    badge.textContent = STATUS_TEXT[s.status] || s.status;
+    $("luid").textContent = s.lastUpdateId ?? "—";
+    $("lvB").textContent = s.levels.bids;
+    $("lvA").textContent = s.levels.asks;
+    $("stApplied").textContent = s.stats.applied;
+    $("stDropped").textContent = s.stats.dropped;
+    $("stGaps").textContent = s.stats.gaps;
+    $("stResyncs").textContent = s.stats.resyncs;
+    $("stSnap").textContent = `${s.stats.snapshotOk}/${s.stats.snapshotAttempts}`;
+    $("lastError").textContent = s.lastError ? "最近异常：" + s.lastError : "";
+    renderRows($("bidsBody"), s.bids, "bid");
+    renderRows($("asksBody"), s.asks, "ask");
+    $("noSyncHint").style.display = s.synced ? "none" : "block";
+  } catch (e) { /* 轮询失败忽略，下轮重试 */ }
+}
+
+async function loadScenario() {
+  try {
+    const sc = await (await fetch("/api/scenario")).json();
+    if (sc.error) return;
+    $("scDelay").checked = sc.snapshot_delay_ms > 0;
+    $("scDelayMs").value = sc.snapshot_delay_ms > 0 ? sc.snapshot_delay_ms : 3000;
+    $("scFail").checked = sc.snapshot_fail;
+    $("scDup").checked = sc.duplicates;
+    $("scGap").checked = sc.gap;
+    $("scDisc").checked = sc.disconnect;
+  } catch (e) { /* 忽略 */ }
+}
+
+loadScenario();
+refresh();
+setInterval(refresh, 500);
+setInterval(loadScenario, 5000);
+</script>
+</body>
+</html>
