@@ -7,12 +7,21 @@
   4. 增量中的数量是该价位的最新总量，0 表示删除该价位；每侧最多保留 100 档；
   5. 缺号（U > L+1）或断线：立即停止发布有效报价并自动重新同步；
   6. 快照失败绝不上报就绪；重连前的在途快照响应不得覆盖新盘口（代际号防护）。
+
+启停并发语义（多标签页同时操作也安全）：
+  - 受理停止即撤下报价（book=None，status=stopping），清理期间启动返回 409；
+  - 同一次停止只清理一次，并发停止请求等待同一个清理任务结束；
+  - 停止请求被客户端取消/断连后，清理在后台继续：必须等采集循环、WebSocket
+    接收任务与在途 HTTP 快照任务全部结束，才落 stopped 终态并返回停止成功；
+  - 每次启动只创建一个可追踪的 Run（主循环 + 全部子任务句柄），旧停止操作凭
+    run token / 代际号防护，不得清空新任务或覆盖新任务的状态。
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -28,6 +37,9 @@ MOCK_HTTP = os.getenv("MOCK_HTTP", "http://localhost:8001")
 MOCK_WS = os.getenv("MOCK_WS", "ws://localhost:8001/ws/btcusdt@depth")
 SNAPSHOT_TIMEOUT = 30.0
 RESYNC_BACKOFF = 1.0
+# 停止清理延迟（秒）：仅用于演示交错启停，可经 /api/config 在线调整
+STOP_CLEANUP_DELAY_MS = int(os.getenv("STOP_CLEANUP_DELAY_MS", "0"))
+MAX_CLEANUP_DELAY_MS = 30000
 
 STATIC_INDEX = Path(__file__).parent / "static" / "index.html"
 
@@ -38,6 +50,10 @@ class GapDetected(Exception):
 
 class ResyncRequired(Exception):
     """连接中断等需要重新同步的情况。"""
+
+
+class ConflictError(Exception):
+    """清理期间收到启动请求等冲突操作（HTTP 409）。"""
 
 
 class OrderBook:
@@ -93,13 +109,36 @@ class OrderBook:
         return bids, asks
 
 
+class Run:
+    """一次采集运行的全部可追踪句柄。
+
+    task     采集主循环（collector_loop）
+    children 该运行派生的 WebSocket 接收任务与在途 HTTP 快照任务，
+             停止时必须全部回收，运行结束前不得丢失句柄。
+    """
+
+    def __init__(self, token: int) -> None:
+        self.token = token
+        self.task: asyncio.Task | None = None
+        self.children: set[asyncio.Task] = set()
+
+    def track(self, task: asyncio.Task) -> asyncio.Task:
+        self.children.add(task)
+        task.add_done_callback(self.children.discard)
+        return task
+
+
 class CollectorState:
     def __init__(self) -> None:
-        self.running = False
-        self.status = "stopped"               # stopped / syncing / synced / resyncing
+        # stopped / syncing / synced / resyncing / stopping
+        self.status = "stopped"
         self.book: OrderBook | None = None    # 仅在 synced 时对外发布，其余时间为 None
         self.generation = 0                   # 代际号：防止在途旧响应覆盖新盘口
-        self.task: asyncio.Task | None = None
+        self.run: Run | None = None           # 当前运行；同一时刻至多一个
+        self.run_token = 0                    # 每次启动递增，旧任务据此识别自己已过期
+        self.stop_lock = asyncio.Lock()       # 串行化停止，并发停止共用同一次清理
+        self.shutdown: asyncio.Task | None = None  # 正在进行的清理任务（断连也保留）
+        self.cleanup_delay = STOP_CLEANUP_DELAY_MS / 1000
         self.last_error: str | None = None
         self.stats = {
             "applied": 0,            # 已应用增量
@@ -109,6 +148,10 @@ class CollectorState:
             "snapshotAttempts": 0,   # 快照尝试次数
             "snapshotOk": 0,         # 快照成功次数
         }
+
+    @property
+    def running(self) -> bool:
+        return self.status not in ("stopped", "stopping")
 
 
 state = CollectorState()
@@ -127,7 +170,7 @@ async def fetch_snapshot() -> dict:
     return data
 
 
-async def sync_cycle() -> None:
+async def sync_cycle(run: Run) -> None:
     """一轮「连接 → 缓存增量 → 取快照 → 对齐 → 直播」周期；异常交由外层重同步。"""
     state.generation += 1
     gen = state.generation
@@ -147,11 +190,13 @@ async def sync_cycle() -> None:
             item_ready.set()
 
     async with websockets.connect(MOCK_WS, ping_interval=20, ping_timeout=20) as ws:
-        pump_task = asyncio.create_task(pump(ws))
+        # WebSocket 接收任务纳入运行句柄，停止时必须等待其结束
+        pump_task = run.track(asyncio.create_task(pump(ws)))
         fetch_task: asyncio.Task | None = None
         try:
             # 步骤一：pump 已在缓存 WebSocket 增量；步骤二：并发取 HTTP 快照
-            fetch_task = asyncio.create_task(fetch_snapshot())
+            # 在途快照任务同样纳入运行句柄，停止时等待其被取消并回收
+            fetch_task = run.track(asyncio.create_task(fetch_snapshot()))
             closed_task = asyncio.create_task(closed.wait())
             await asyncio.wait({fetch_task, closed_task}, return_when=asyncio.FIRST_COMPLETED)
             closed_task.cancel()
@@ -160,8 +205,8 @@ async def sync_cycle() -> None:
                 fetch_task.cancel()
                 raise ResyncRequired("快照在途期间连接断开")
             snapshot = fetch_task.result()  # 快照失败在此抛错，绝不将就绪置真
-            if gen != state.generation:
-                return  # 在途旧响应不得覆盖新盘口
+            if run.token != state.run_token or gen != state.generation:
+                return  # 在途旧响应/旧运行不得覆盖新盘口
 
             book = OrderBook()
             book.load_snapshot(snapshot)
@@ -176,7 +221,7 @@ async def sync_cycle() -> None:
                 if closed.is_set():
                     raise ResyncRequired("连接断开")
                 if not published:
-                    if gen != state.generation:
+                    if run.token != state.run_token or gen != state.generation:
                         return  # 在途旧周期不得发布
                     state.book = book  # 对齐完成，开始发布有效报价
                     state.status = "synced"
@@ -192,55 +237,137 @@ async def sync_cycle() -> None:
                 fetch_task.cancel()  # 停止/重同步时取消在途快照请求
 
 
-async def collector_loop() -> None:
-    while state.running:
-        try:
-            await sync_cycle()
-        except asyncio.CancelledError:
-            raise
-        except GapDetected as exc:
-            state.stats["gaps"] += 1
-            state.last_error = str(exc)
-        except (ResyncRequired, WebSocketException, OSError) as exc:
-            state.last_error = f"连接问题: {exc}"
-        except httpx.HTTPError as exc:
-            state.last_error = f"快照失败: {exc}"
-        except Exception as exc:  # noqa: BLE001
-            state.last_error = f"未预期错误: {exc!r}"
-        # 缺号/断线/快照失败：立即停止发布有效报价
-        state.book = None
-        if state.running:
+async def collector_loop(run: Run) -> None:
+    try:
+        while True:
+            try:
+                await sync_cycle(run)
+            except asyncio.CancelledError:
+                raise
+            except GapDetected as exc:
+                state.stats["gaps"] += 1
+                state.last_error = str(exc)
+            except (ResyncRequired, WebSocketException, OSError) as exc:
+                state.last_error = f"连接问题: {exc}"
+            except httpx.HTTPError as exc:
+                state.last_error = f"快照失败: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                state.last_error = f"未预期错误: {exc!r}"
+            # 旧运行已被新启动取代：不得再修改新运行的状态
+            if run.token != state.run_token:
+                break
+            # 缺号/断线/快照失败：立即停止发布有效报价
+            state.book = None
             state.status = "resyncing"
             state.stats["resyncs"] += 1
             await asyncio.sleep(RESYNC_BACKOFF)
-    state.status = "stopped"
-    state.book = None
+    except asyncio.CancelledError:
+        # 停止清理协调器负责落 stopped 终态，这里只负责安静退出
+        return
 
 
 async def start_collection() -> None:
-    if state.running:
-        return
-    state.running = True
+    """启动采集：清理期间冲突返回 409；已在运行则幂等；每次只建一个 Run。"""
+    if state.status == "stopping" or (
+        state.shutdown is not None and not state.shutdown.done()
+    ):
+        raise ConflictError("采集正在停止清理中，请等待完全停止后再启动")
+    if state.run is not None:
+        return  # 已在运行：幂等返回，绝不重复创建任务
+
+    state.run_token += 1
+    run = Run(state.run_token)
+    state.run = run
+    state.book = None
     state.last_error = None
-    state.task = asyncio.create_task(collector_loop())
+    state.status = "syncing"
+    run.task = asyncio.create_task(collector_loop(run))
+
+
+async def _shutdown_collection(run: Run) -> None:
+    """一次停止的完整清理：主循环 → WS 接收 / 在途快照子任务全部回收后落终态。
+
+    本任务由 stop_collection 以脱离请求生命周期的方式托管，请求取消或断连
+    都不会中断它；finally 中的 run 身份检查保证旧操作不会覆盖之后启动的新运行。
+    """
+    try:
+        if run.task is not None:
+            run.task.cancel()
+        if state.cleanup_delay > 0:
+            # 演示用可调清理延迟：拉长“停止中”窗口，便于在多个标签页交错启停
+            await asyncio.sleep(state.cleanup_delay)
+        if run.task is not None:
+            try:
+                await run.task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                state.last_error = f"采集循环异常退出: {exc!r}"
+        # 兜底回收子任务（正常路径下 sync_cycle 的 finally 已取消它们）：
+        # 必须等 WebSocket 接收与在途 HTTP 快照全部结束
+        while run.children:
+            pending = [t for t in run.children if not t.done()]
+            if not pending:
+                break
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        # 代际防护：仅当当前运行仍是本次停止的运行时才落终态，
+        # 旧停止操作不得清空新任务或覆盖其状态
+        if state.run is run:
+            state.status = "stopped"
+            state.book = None
+            state.run = None
 
 
 async def stop_collection() -> None:
-    state.running = False
-    if state.task is not None:
-        state.task.cancel()
+    """停止采集。
+
+    - 受理即撤下报价并进入 stopping；同一次清理只做一次，并发停止共享同一个
+      后台清理任务并等待其结束；
+    - 等待期间请求被取消/断连只影响调用方，清理在后台继续，句柄保留在
+      state.shutdown，下一个停止请求会接着等同一个清理。
+    """
+    async with state.stop_lock:
+        run = state.run
+        if run is None:
+            # 并发停止晚到一步：清理已结束，幂等返回
+            state.status = "stopped"
+            state.book = None
+            if state.shutdown is not None and state.shutdown.done():
+                state.shutdown = None
+            return
+
+        shutdown = state.shutdown
+        if shutdown is None or shutdown.done():
+            # 受理停止：在第一个 await 之前同步撤下报价
+            state.status = "stopping"
+            state.book = None
+            # 脱离请求生命周期托管：客户端断连后清理仍继续
+            shutdown = asyncio.ensure_future(_shutdown_collection(run))
+            state.shutdown = shutdown
+
         try:
-            await state.task
+            # shield：外层请求任务被取消时，内部清理任务不受影响
+            await asyncio.shield(shutdown)
         except asyncio.CancelledError:
-            pass
-        state.task = None
-    state.status = "stopped"
-    state.book = None
+            raise  # 放弃本次响应，但 state.shutdown 仍持有正在进行的清理
+        if state.shutdown is shutdown:
+            state.shutdown = None
 
 
 # ------------------------------- HTTP API -------------------------------
 
-app = FastAPI(title="Depth Collector")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    # 进程退出（含容器停止）：若仍有运行中的采集，按同一套清理流程回收全部句柄
+    if state.run is not None:
+        await _shutdown_collection(state.run)
+
+
+app = FastAPI(title="Depth Collector", lifespan=lifespan)
 
 
 class ControlBody(BaseModel):
@@ -255,6 +382,10 @@ class ScenarioBody(BaseModel):
     disconnect: bool = False
 
 
+class ConfigBody(BaseModel):
+    stop_cleanup_delay_ms: int | None = None
+
+
 @app.get("/")
 async def index():
     return FileResponse(STATIC_INDEX)
@@ -263,12 +394,18 @@ async def index():
 @app.post("/api/control")
 async def api_control(body: ControlBody):
     if body.action == "start":
-        await start_collection()
+        try:
+            await start_collection()
+        except ConflictError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={"error": str(exc), "status": state.status},
+            )
     elif body.action == "stop":
         await stop_collection()
     else:
         return JSONResponse(status_code=400, content={"error": "action 须为 start/stop"})
-    return {"ok": True, "running": state.running}
+    return {"ok": True, "running": state.running, "status": state.status}
 
 
 @app.get("/api/state")
@@ -279,7 +416,7 @@ async def api_state():
         last_update_id = state.book.last_update_id
         levels = {"bids": len(state.book.bids), "asks": len(state.book.asks)}
     else:
-        # 未同步：不发布任何报价，下游不得使用
+        # 未同步/停止中：不发布任何报价，下游不得使用
         bids, asks, last_update_id, levels = [], [], None, {"bids": 0, "asks": 0}
     return {
         "running": state.running,
@@ -292,8 +429,28 @@ async def api_state():
         "levels": levels,
         "stats": state.stats,
         "lastError": state.last_error,
+        "cleanupDelayMs": int(state.cleanup_delay * 1000),
         "source": {"http": MOCK_HTTP, "ws": MOCK_WS},
     }
+
+
+@app.get("/api/config")
+async def api_get_config():
+    return {"stop_cleanup_delay_ms": int(state.cleanup_delay * 1000)}
+
+
+@app.post("/api/config")
+async def api_set_config(body: ConfigBody):
+    delay_ms = body.stop_cleanup_delay_ms
+    if delay_ms is None:
+        return JSONResponse(status_code=400, content={"error": "缺少 stop_cleanup_delay_ms"})
+    if not 0 <= delay_ms <= MAX_CLEANUP_DELAY_MS:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"stop_cleanup_delay_ms 须在 0~{MAX_CLEANUP_DELAY_MS} 之间"},
+        )
+    state.cleanup_delay = delay_ms / 1000
+    return {"ok": True, "stop_cleanup_delay_ms": delay_ms}
 
 
 @app.get("/api/scenario")

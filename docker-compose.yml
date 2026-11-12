@@ -16,6 +16,8 @@ services:
     environment:
       MOCK_HTTP: http://mock:8001
       MOCK_WS: ws://mock:8001/ws/btcusdt@depth
+      # 演示用停止清理延迟（毫秒），也可在网页“停止清理演示”面板在线调整（0~30000）
+      STOP_CLEANUP_DELAY_MS: "1500"
     ports:
       - "8000:8000"   # 浏览器入口：http://localhost:8000
     depends_on:

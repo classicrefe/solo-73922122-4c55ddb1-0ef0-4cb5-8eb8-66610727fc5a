@@ -8,7 +8,7 @@
   :root {
     --bg: #0f1420; --panel: #1a2130; --border: #2a3348;
     --text: #e6e9f0; --muted: #8a93a6;
-    --green: #2ebd85; --red: #f6465d; --amber: #f0b90b; --gray: #6b7280;
+    --green: #2ebd85; --red: #f6465d; --amber: #f0b90b; --gray: #6b7280; --blue: #4c8dff;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; padding: 20px; }
@@ -22,10 +22,14 @@
   .badge.synced { background: rgba(46,189,133,.15); color: var(--green); }
   .badge.syncing, .badge.resyncing { background: rgba(240,185,11,.15); color: var(--amber); }
   .badge.stopped { background: rgba(107,114,128,.2); color: var(--gray); }
+  .badge.stopping { background: rgba(76,141,255,.15); color: var(--blue); animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
   .row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
   button { background: var(--amber); border: none; color: #1a2130; font-weight: 700; padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; }
   button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
-  button:hover { filter: brightness(1.1); }
+  button.danger { background: transparent; border: 1px solid var(--red); color: var(--red); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:hover:not(:disabled) { filter: brightness(1.1); }
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
   th, td { padding: 6px 10px; font-size: 14px; text-align: right; }
   th:first-child, td:first-child { text-align: left; }
@@ -37,11 +41,14 @@
   .kv .k { font-size: 12px; color: var(--muted); }
   .kv .v { font-size: 16px; font-weight: 600; margin-top: 2px; }
   .err { color: var(--red); font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .msg { font-size: 13px; margin-top: 10px; min-height: 18px; color: var(--muted); }
   label.sc { display: flex; align-items: center; gap: 8px; padding: 8px 0; font-size: 14px; cursor: pointer; }
   input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--amber); }
   input[type=number] { width: 90px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 4px 8px; font-size: 14px; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.6; }
   .nosync { color: var(--muted); text-align: center; padding: 24px 0; font-size: 14px; }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -54,10 +61,12 @@
     <div class="row">
       <button id="btnStart">启动采集</button>
       <button id="btnStop" class="ghost">停止采集</button>
+      <button id="btnCancel" class="danger" style="display:none">取消等待</button>
       <span id="statusBadge" class="badge stopped">已停止</span>
       <span style="color:var(--muted);font-size:13px">lastUpdateId (L)：<b id="luid" style="color:var(--text)">—</b></span>
       <span style="color:var(--muted);font-size:13px">档位：买 <b id="lvB" style="color:var(--text)">0</b> / 卖 <b id="lvA" style="color:var(--text)">0</b></span>
     </div>
+    <div class="msg" id="ctrlMsg"></div>
     <div class="kv">
       <div class="item"><div class="k">已应用增量</div><div class="v" id="stApplied">0</div></div>
       <div class="item"><div class="k">丢弃（重复/过期）</div><div class="v" id="stDropped">0</div></div>
@@ -69,7 +78,7 @@
   </div>
 
   <div class="panel full">
-    <h2>买卖前五档（未同步时不发布报价）</h2>
+    <h2>买卖前五档（未同步/停止中不发布报价）</h2>
     <div class="books">
       <div>
         <table>
@@ -85,6 +94,19 @@
       </div>
     </div>
     <div class="nosync" id="noSyncHint">采集未就绪，报价不可用</div>
+  </div>
+
+  <div class="panel full">
+    <h2>停止清理演示（作用于采集端，仅演示交错启停）</h2>
+    <div class="row">
+      <label class="sc" style="padding:0">停止清理延迟
+        <input type="number" id="cleanupMs" min="0" max="30000" step="100" value="0"> ms</label>
+      <button id="btnSaveCleanup" class="ghost" style="padding:6px 14px">应用延迟</button>
+      <span class="hint" style="margin-top:0">
+        停止受理后先撤下报价并进入「停止中」，等待该延迟后再回收采集循环、WebSocket 接收与在途快照任务；
+        延迟期间点击启动将收到 409，可在两个标签页中交错启停观察竞争处理。
+      </span>
+    </div>
   </div>
 
   <div class="panel full">
@@ -109,15 +131,62 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const STATUS_TEXT = { stopped: "已停止", syncing: "同步中（缓存增量/取快照）", synced: "已同步 · 发布有效报价", resyncing: "重新同步中" };
+const STATUS_TEXT = {
+  stopped: "已停止",
+  syncing: "同步中（缓存增量/取快照）",
+  synced: "已同步 · 发布有效报价",
+  resyncing: "重新同步中",
+  stopping: "停止中（清理采集循环 / WS / 在途快照）",
+};
+
+// 在途控制请求：允许并发启停；AbortController 支持“取消等待”（仅放弃本页响应，服务端清理继续）
+const pending = new Set();
+function postControl(body) {
+  const ctrl = new AbortController();
+  pending.add(ctrl);
+  updatePendingUi();
+  const actionText = body.action === "start" ? "启动" : "停止";
+  return fetch("/api/control", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: ctrl.signal,
+  })
+    .then(async r => {
+      const data = await r.json().catch(() => ({}));
+      if (r.status === 409) {
+        $("ctrlMsg").innerHTML = `⚠ ${actionText}请求冲突（409）：${data.error || "采集正在停止清理中，请等待完全停止"}`;
+      } else if (!r.ok) {
+        $("ctrlMsg").textContent = `✗ ${actionText}失败：${data.error || r.status}`;
+      } else {
+        $("ctrlMsg").textContent = `✓ ${actionText}请求完成，当前状态：${STATUS_TEXT[data.status] || data.status}`;
+      }
+    })
+    .catch(e => {
+      if (e.name === "AbortError") {
+        $("ctrlMsg").textContent = "已取消本页等待：服务端清理不受影响，仍会继续到完全停止";
+      } else {
+        $("ctrlMsg").textContent = `✗ ${actionText}请求异常：${e.message}`;
+      }
+    })
+    .finally(() => { pending.delete(ctrl); updatePendingUi(); refresh(); });
+}
+
+function updatePendingUi() {
+  const busy = pending.size > 0;
+  $("btnCancel").style.display = busy ? "inline-block" : "none";
+  $("btnCancel").innerHTML = busy
+    ? `<span class="spinner"></span>取消等待（${pending.size} 个在途请求）` : "";
+}
+
+$("btnStart").onclick = () => postControl({ action: "start" });
+$("btnStop").onclick = () => postControl({ action: "stop" });
+$("btnCancel").onclick = () => { pending.forEach(c => c.abort()); };
 
 async function post(url, body) {
   const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   return r.json();
 }
-
-$("btnStart").onclick = () => post("/api/control", { action: "start" }).then(refresh);
-$("btnStop").onclick = () => post("/api/control", { action: "stop" }).then(refresh);
 
 function currentScenario() {
   return {
@@ -131,6 +200,19 @@ function currentScenario() {
 for (const id of ["scDelay", "scDelayMs", "scFail", "scDup", "scGap", "scDisc"]) {
   $(id).onchange = () => post("/api/scenario", currentScenario());
 }
+
+$("btnSaveCleanup").onclick = async () => {
+  const ms = Math.max(0, Math.min(30000, +$("cleanupMs").value || 0));
+  const r = await fetch("/api/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stop_cleanup_delay_ms: ms }),
+  });
+  const data = await r.json().catch(() => ({}));
+  $("ctrlMsg").textContent = r.ok
+    ? `✓ 清理延迟已设为 ${data.stop_cleanup_delay_ms} ms（下一次停止生效）`
+    : `✗ 配置失败：${data.error || r.status}`;
+};
 
 function renderRows(tbody, rows, cls) {
   tbody.innerHTML = rows.length
@@ -157,6 +239,7 @@ async function refresh() {
     renderRows($("bidsBody"), s.bids, "bid");
     renderRows($("asksBody"), s.asks, "ask");
     $("noSyncHint").style.display = s.synced ? "none" : "block";
+    if (document.activeElement !== $("cleanupMs")) $("cleanupMs").value = s.cleanupDelayMs ?? 0;
   } catch (e) { /* 轮询失败忽略，下轮重试 */ }
 }
 
